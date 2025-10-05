@@ -6,6 +6,9 @@ import { PrismaClient } from '@prisma/client';
 import { Queue } from 'bullmq';
 import path from 'node:path';
 import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import stream from 'node:stream';
+import { google } from 'googleapis';
 
 const app = express();
 const prisma = new PrismaClient();
@@ -45,6 +48,82 @@ app.use(morgan('dev'));
 app.use('/output', express.static(OUTPUT_DIR));
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// Download proxy: fetches a remote URL server-side and returns it as an attachment.
+// Useful for making cross-origin images downloadable and for streaming Google Drive / Dropbox files.
+app.get('/download', async (req, res) => {
+  const { url, filename } = req.query || {};
+  if (!url) return res.status(400).send('url query required');
+  let parsed;
+  try {
+    parsed = new URL(String(url));
+  } catch (e) {
+    return res.status(400).send('invalid url');
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)) return res.status(400).send('invalid protocol');
+
+  try {
+    // Handle Google Drive file links specially when requested via the `drive` query flag
+    if (parsed.hostname.includes('drive.google.com')) {
+      // If the user passed drive=1 we attempt to stream via Drive API (requires service account JSON in env)
+      if (req.query.drive === '1') {
+        // try streaming through Drive API
+        try {
+          const fileIdMatch = parsed.pathname.match(/\/d\/([a-zA-Z0-9_-]+)/);
+          const fileId = fileIdMatch ? fileIdMatch[1] : null;
+          if (!fileId) return res.status(400).send('could not parse drive file id');
+          // stream via Drive API
+          const keyJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+          if (!keyJson) return res.status(501).send('drive proxy not configured');
+          const auth = new google.auth.GoogleAuth({
+            credentials: JSON.parse(keyJson),
+            scopes: ['https://www.googleapis.com/auth/drive.readonly']
+          });
+          const drive = google.drive({ version: 'v3', auth });
+          // set headers to hint download
+          res.setHeader('Content-Type', 'application/octet-stream');
+          const suggested = filename || `${fileId}`;
+          res.setHeader('Content-Disposition', `attachment; filename="${suggested.replace(/\"/g, '')}"`);
+          const driveRes = await drive.files.get({ fileId, alt: 'media' }, { responseType: 'stream' });
+          driveRes.data.pipe(res);
+          return;
+        } catch (driveErr) {
+          console.error('Drive proxy streaming failed', driveErr);
+          return res.status(502).send('drive proxy failed');
+        }
+      }
+      // otherwise fallthrough to normal fetch (may return HTML preview)
+    }
+
+    const r = await fetch(String(url));
+    if (!r.ok) return res.status(502).send('failed to fetch resource');
+    const contentType = r.headers.get('content-type') || 'application/octet-stream';
+    // pipe response to client without buffering large files fully in memory
+    res.setHeader('Content-Type', contentType);
+    const suggested = filename || path.basename(parsed.pathname) || 'download';
+    res.setHeader('Content-Disposition', `attachment; filename="${suggested.replace(/\"/g, '')}"`);
+    const reader = r.body.getReader();
+    const pass = new stream.PassThrough();
+    // convert the ReadableStream (web) to node stream
+    (async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          pass.write(Buffer.from(value));
+        }
+      } catch (e) {
+        console.error('stream read error', e);
+      } finally {
+        pass.end();
+      }
+    })();
+    pass.pipe(res);
+  } catch (e) {
+    console.error('download proxy error', e);
+    res.status(500).send('error fetching resource');
+  }
+});
 
 // Create Job
 app.post('/jobs', async (req, res) => {
