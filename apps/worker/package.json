@@ -1,0 +1,14 @@
+{
+  "name": "photocard-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/worker.js"
+  },
+  "dependencies": {
+    "bullmq": "5.7.15",
+    "dotenv": "16.4.5",
+    "playwright": "1.47.2",
+    "node-fetch": "3.3.2"
+  }
+}
